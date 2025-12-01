@@ -21,12 +21,14 @@ import (
 	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/klog/v2"
 
 	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 )
@@ -201,6 +203,19 @@ func newWatchMux() *watchMux {
 	}
 }
 
+// invalidatableWatchMux extends watchMux with the ability to send invalidation events
+type invalidatableWatchMux struct {
+	*watchMux
+	stopped chan struct{} // Signals when the watch is stopped
+}
+
+func newInvalidatableWatchMux() *invalidatableWatchMux {
+	return &invalidatableWatchMux{
+		watchMux: newWatchMux(),
+		stopped:  make(chan struct{}),
+	}
+}
+
 // AddSource shall be called before Start
 func (w *watchMux) AddSource(watcher watch.Interface, decorator func(watch.Event)) {
 	w.sources = append(w.sources, decoratedWatcher{
@@ -276,6 +291,62 @@ func (w *watchMux) startWatchSource(source watch.Interface, decorator func(watch
 		case w.result <- copyEvent:
 		}
 	}
+}
+
+// Start extends the base Start method to handle the stopped channel
+func (w *invalidatableWatchMux) Start() {
+	w.watchMux.Start()
+	
+	// Close stopped channel when the watch ends
+	go func() {
+		<-w.watchMux.done
+		close(w.stopped)
+	}()
+}
+
+// Invalidate sends an error event to trigger client reconnection
+func (w *invalidatableWatchMux) Invalidate() {
+	select {
+	case <-w.watchMux.done:
+		// Watch already stopped, nothing to do
+		return
+	default:
+	}
+
+	// Send a synthetic error event to signal cache invalidation
+	// This will cause the client to reconnect
+	errorEvent := watch.Event{
+		Type: watch.Error,
+		Object: &metav1.Status{
+			Status:  metav1.StatusFailure,
+			Message: "Cluster topology changed, please reconnect to get updated resource view",
+			Reason:  metav1.StatusReasonExpired,
+			Code:    410, // HTTP Gone - resource no longer available at this version
+		},
+	}
+
+	select {
+	case <-w.watchMux.done:
+		// Watch stopped while we were preparing the event
+		return
+	case w.watchMux.result <- errorEvent:
+		klog.V(4).Infof("Sent cache invalidation event to watch client")
+	case <-time.After(time.Second):
+		// If we can't send within 1 second, just stop the watch
+		// This prevents blocking if the client isn't reading
+		klog.Warningf("Failed to send invalidation event within timeout, stopping watch")
+		w.Stop()
+	}
+}
+
+// StoppedCh returns a channel that is closed when the watch is stopped
+func (w *invalidatableWatchMux) StoppedCh() <-chan struct{} {
+	return w.stopped
+}
+
+// Stop extends the base Stop method
+func (w *invalidatableWatchMux) Stop() {
+	w.watchMux.Stop()
 }
 
 // MultiNamespace contains multiple namespaces.
